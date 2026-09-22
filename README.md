@@ -80,7 +80,7 @@ docker compose up --build
 | POST | `/api/v1/definitions/{device_type}/{version}/deactivate` | 停用定义 |
 | POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合或任一版本含 `repeat` 定义返回 422） |
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
-| POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析 |
+| POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析；支持 `version_mode=detect` 在同一批分块中自动识别混合固件版本 |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 | POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
@@ -415,7 +415,8 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 | 参数 | 说明 |
 | ---- | ---- |
-| `device_type` / `version` | 版本选择规则与 `/parse` 一致（`version` 缺省取最新启用版本） |
+| `device_type` / `version` | 固定模式（`version_mode="fixed"`，默认）下的版本选择规则与 `/parse` 一致（`version` 缺省取最新启用版本） |
+| `version_mode` | `"fixed"`（默认）：全部帧按固定版本解析；`"detect"`：每帧用该设备类型的**全部已注册版本（含停用）**自动识别，同一批 `chunks` 允许混合固件版本。detect 模式下不允许传 `version`（返回 422） |
 | `sync_hex` | 帧头同步字节（一或多字节），如 `"aa55"`；支持跨块匹配（`…aa` 与 `55…` 分两块到达也能识别） |
 | `length_field_offset` | 长度字段相对同步头的字节偏移（≥0） |
 | `length_field_bytes` | 无符号长度字段宽度（1～8 字节） |
@@ -437,6 +438,7 @@ total = length_field_offset + length_field_bytes + length_value + length_adjustm
 - **噪声**：同步头之前的字节作为 `noise` 丢弃（包括尾部恰好无法构成同步头的同步起始字节）。
 - **非法长度**：长度值加修正后短于帧头本身（如为负）时丢弃该候选同步字节并继续寻找下一个同步头。
 - **解析 / 校验失败**：整帧到达后交给现有解析器；报文过短、解析失败、校验字段被分支跳过、校验和不符或定义未完整消费帧（存在尾部位）时，**逐字节重同步**——只丢弃该候选同步字节，从下一个同步头重试，避免一个坏帧导致整流失联。
+- **detect 模式的识别与拒绝规则**：每个完整候选帧都按**版本顺序**尝试全部已注册版本（含停用），判定标准与 `/detect` 完全一致（完整消费帧 + 配置了校验和时校验通过）。**恰好一个版本命中**才接收该帧，帧结果中携带该帧的 `version` 与 `definition_active`，因此同一批 `chunks` 中的帧可以来自不同固件版本（例如升级交替期的设备总线）。**零命中**时同样逐字节重同步，丢弃记录的 `reason` 为 `parse_error`（全部版本均仅因校验和不符时为 `checksum`），并在 `failures` 中逐版本列出失败原因；**多版本命中**时也丢弃候选帧，但 `reason` 为独立的 **`ambiguous_version`** 且在 `candidates` 中列出候选版本——**不会**静默选择最新版本。
 - **末尾未完成帧不是错误**：最后一个分块处理完后仍滞留的字节（半帧或半个同步头）通过 `incomplete_hex` 返回，调用方可在后续请求中续传（本接口为无状态单次重组，续传需调用方自行拼接后重发）。
 - **硬性上限**：滞留的未分帧缓冲超过 **1 MiB**，或长度字段声明的单帧超过 **64 KiB**，返回 `422`（这类情况无法安全缓冲，不做静默丢弃）。
 
@@ -444,8 +446,9 @@ total = length_field_offset + length_field_bytes + length_value + length_adjustm
 
 **响应**
 
-- `frames[]`：每帧含相对拼接字节流的原始半开区间偏移 `start` / `end`、`length`、原始 `hex`，以及与 `/parse` 完全一致的 `result`（字段、分支、校验结果等）。
-- `discarded_ranges[]`：每个被丢弃区间含 `start` / `end` / `length` / `hex`、`reason`（`noise` / `invalid_length` / `parse_error` / `checksum`）及 `detail`。
+- 顶层 `version_mode` 回显识别模式；`fixed` 模式下顶层 `version` / `definition_active` 即固定使用的定义，`detect` 模式下两者为 `null`（版本是逐帧属性）。
+- `frames[]`：每帧含相对拼接字节流的原始半开区间偏移 `start` / `end`、`length`、原始 `hex`，以及与 `/parse` 完全一致的 `result`（字段、分支、校验结果等）；detect 模式下每帧 `result` 还含 `version` / `definition_active`。
+- `discarded_ranges[]`：每个被丢弃区间含 `start` / `end` / `length` / `hex`、`reason`（`noise` / `invalid_length` / `parse_error` / `checksum` / `ambiguous_version`）及 `detail`。detect 模式下零命中记录额外含 `failures`（逐版本的 `version` / `active` / `reason`），多版本命中记录额外含 `candidates`（`version` / `active` 列表，按版本顺序）；固定模式不包含这两个字段。
 - `incomplete_hex` / `incomplete_bytes`：末尾滞留的未完成字节（为空串表示流恰好在帧边界结束）。
 - 另有 `received_bytes`、`frame_count`、`discarded_count`、`discarded_bytes` 与 `limits` 汇总。
 
@@ -491,6 +494,78 @@ curl -X POST http://localhost:8000/api/v1/stream/parse \
 ```
 
 > 第二个分块尾部 `aa0402ffff` 是尚未收完（缺 1 字节校验位）的帧，计入 `incomplete_hex` 而**不**返回错误。`chunks` 为空列表是合法的空流（200，无帧无丢弃）；某个分块 hex 非法时返回 `422` 并在 `detail` 中标注下标（如 `chunks[1]: …`），整个请求不会产生部分分帧结果。
+
+#### detect 模式：同一批分块解析混合固件版本
+
+设备类型 `stream_mix` 注册了两个字节长度不同的版本（均为 `AA | len(1B) | seq(1B) | … | xor8(1B)`，长度字段在偏移 1、占 1 字节）：
+
+- `1.0.0`：`seq + xor8`，长度值 2，整帧 4 字节；
+- `2.0.0`：`seq + temperature(2B) + xor8`，长度值 4，整帧 6 字节。
+
+一条总线在固件升级交替期可能混有两种帧。请求中传 `"version_mode": "detect"`（**不传** `version`），服务对每个完整候选帧尝试全部已注册版本（含停用），恰好一个版本命中才接收：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stream/parse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_type": "stream_mix",
+    "version_mode": "detect",
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "length_endianness": "big",
+    "length_adjustment": 0,
+    "chunks": ["aa040b01", "2c22aa020f"]
+  }'
+```
+
+上例第一块含一个被切断的 2.0.0 帧（`aa040b01 2c22`，`seq=11`、温度小整数，合计 6 字节），第二块尾部紧跟一个 1.0.0 帧（`aa020f` + xor8，4 字节）。响应（节选）：
+
+```json
+{
+  "device_type": "stream_mix",
+  "version": null,
+  "definition_active": null,
+  "version_mode": "detect",
+  "frame_count": 2,
+  "frames": [
+    {"start": 0, "end": 6, "length": 6, "hex": "aa040b012c22",
+     "result": {"version": "2.0.0", "definition_active": true,
+                "fields": [{"name": "seq", "value": 11}, {"name": "temperature", "value": 300}],
+                "checksum": {"valid": true}}},
+    {"start": 6, "end": 10, "length": 4, "hex": "aa020f...",
+     "result": {"version": "1.0.0", "definition_active": true,
+                "fields": [{"name": "seq", "value": 15}],
+                "checksum": {"valid": true}}}
+  ],
+  "discarded_ranges": []
+}
+```
+
+- **命中已停用版本**也照常接收，该帧 `result.definition_active` 为 `false`。
+- **零命中**：候选同步字节被逐字节重同步丢弃，`reason` 为 `parse_error`（或全部版本仅校验和不符时的 `checksum`），`failures` 逐版本给出原因：
+
+```json
+{"start": 0, "end": 1, "hex": "aa", "reason": "parse_error",
+ "detail": "no registered version matches the frame (2 version(s) tried): 1.0.0: message too short: ...; 2.0.0: message too short: ...",
+ "failures": [
+   {"version": "1.0.0", "active": false, "reason": "message too short: need 8 bits at offset 24, only 0 bits left"},
+   {"version": "2.0.0", "active": true,  "reason": "message too short: ..."}
+ ]}
+```
+
+- **多版本命中**：候选帧同样被丢弃，但 `reason` 是 `ambiguous_version`，并在 `candidates` 中按版本顺序列出命中的版本（含停用状态），服务**不会**静默选择最新版：
+
+```json
+{"start": 0, "end": 1, "hex": "aa", "reason": "ambiguous_version",
+ "detail": "frame matches 2 registered versions (1.0.0, 2.0.0); cannot pick a version without an explicit hint",
+ "candidates": [
+   {"version": "1.0.0", "active": true},
+   {"version": "2.0.0", "active": false}
+ ]}
+```
+
+> detect 模式沿用相同的 **64 KiB 单帧**与 **1 MiB 缓冲**硬性上限；设备类型下没有任何注册版本（含停用）时返回 `404`；同时传 `version` 与 `"version_mode": "detect"` 返回 `422`。不传 `version_mode`（或传 `"fixed"`）时行为与旧版完全一致，顶层仍返回固定的 `version` / `definition_active`。
 
 ### 9. 解析回归样例（/fixtures）
 

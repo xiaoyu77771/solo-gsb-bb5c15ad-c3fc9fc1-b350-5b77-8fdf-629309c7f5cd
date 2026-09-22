@@ -15,7 +15,9 @@ from .framing import (
     MAX_FRAME_SIZE,
     FrameSpec,
     FramingError,
+    REASON_AMBIGUOUS_VERSION,
     REASON_CHECKSUM,
+    REASON_PARSE_ERROR,
     RejectFrame,
     StreamFramer,
 )
@@ -200,6 +202,56 @@ def _select_definition(device_type: str, version: Optional[str]) -> dict:
     return record
 
 
+def _match_definition(record: dict, data: bytes, unit: str = "message"):
+    """Shared by /detect and detect-mode /stream/parse: decide whether one
+    registered version accepts a complete byte payload.
+
+    A version accepts when the definition fully consumes the payload (no
+    trailing bits) and, when a checksum is configured, its verification
+    passes (a skipped checksum field counts as a failure); definitions
+    without a checksum are judged on full consumption alone.
+
+    Returns ``(result, None)`` on acceptance, otherwise
+    ``(None, (reason, detail))`` where ``reason`` is ``REASON_CHECKSUM`` for
+    a mismatch and ``REASON_PARSE_ERROR`` for every other failure.
+    """
+    try:
+        result = parse_message(record["fields"], record["checksum"], data)
+    except ParseError as exc:
+        return None, (REASON_PARSE_ERROR, str(exc))
+    if result["trailing_bits"]:
+        return None, (
+            REASON_PARSE_ERROR,
+            f"definition does not fully consume the {unit}: "
+            f"{result['trailing_bits']} trailing bit(s)",
+        )
+    if record["checksum"]:
+        checksum = result["checksum"]
+        if checksum is None:
+            return None, (
+                REASON_PARSE_ERROR,
+                f"checksum field '{record['checksum']['field']}' was not parsed "
+                f"(skipped by an earlier branch)",
+            )
+        if not checksum["valid"]:
+            return None, (
+                REASON_CHECKSUM,
+                f"checksum mismatch: expected {checksum['expected_hex']}, "
+                f"calculated {checksum['calculated_hex']}",
+            )
+    return result, None
+
+
+def _parse_result_for_record(record: dict, result: dict) -> dict:
+    """Shape the parser output exactly like /parse for a matched record."""
+    return {
+        "device_type": record["device_type"],
+        "version": record["version"],
+        "definition_active": record["active"],
+        **result,
+    }
+
+
 @app.post("/api/v1/parse")
 def parse(req: ParseRequest):
     """Parse a hex payload against a definition (latest active version unless
@@ -246,41 +298,13 @@ def detect(req: DetectRequest):
     candidates = []
     failures = []
     for record in records:
-        try:
-            result = parse_message(record["fields"], record["checksum"], data)
-        except ParseError as exc:
-            reason = str(exc)
-        else:
-            reason = None
-            if result["trailing_bits"]:
-                reason = (
-                    f"definition does not fully consume the message: "
-                    f"{result['trailing_bits']} trailing bit(s)"
-                )
-            elif record["checksum"]:
-                checksum = result["checksum"]
-                if checksum is None:
-                    reason = (
-                        f"checksum field '{record['checksum']['field']}' was not parsed "
-                        f"(skipped by an earlier branch)"
-                    )
-                elif not checksum["valid"]:
-                    reason = (
-                        f"checksum mismatch: expected {checksum['expected_hex']}, "
-                        f"calculated {checksum['calculated_hex']}"
-                    )
-
-        if reason is None:
+        result, rejection = _match_definition(record, data, unit="message")
+        if rejection is None:
             candidates.append(
                 {
                     "version": record["version"],
                     "active": record["active"],
-                    "result": {
-                        "device_type": record["device_type"],
-                        "version": record["version"],
-                        "definition_active": record["active"],
-                        **result,
-                    },
+                    "result": _parse_result_for_record(record, result),
                 }
             )
         else:
@@ -288,7 +312,7 @@ def detect(req: DetectRequest):
                 {
                     "version": record["version"],
                     "active": record["active"],
-                    "reason": reason,
+                    "reason": rejection[1],
                 }
             )
 
@@ -332,8 +356,40 @@ def stream_parse(req: StreamParseRequest):
     chunk -- a partial frame or a partial sync marker -- come back as
     ``incomplete_hex`` and are never an error. A retained buffer above 1 MiB
     or a single declared frame above 64 KiB returns 422.
+
+    ``version_mode`` selects how each complete frame is validated:
+
+    * ``fixed`` (the default): every frame is parsed against the explicit
+      ``version`` or, when omitted, the latest active version -- the original
+      behaviour, unchanged.
+    * ``detect``: no ``version`` hint is allowed; every complete candidate
+      frame is tried against *all* registered versions of the device type,
+      including inactive ones. A frame is accepted only when exactly one
+      version fully consumes it and verifies its checksum, so one batch of
+      chunks may contain frames from mixed firmware versions; each frame
+      result then reports its own ``version`` and ``definition_active``.
+      Zero matches triggers the same one-byte resynchronisation as fixed
+      mode and records every version's failure reason; frames matching
+      several versions are discarded as well, but with the distinct
+      ``ambiguous_version`` reason and a ``candidates`` list -- the newest
+      version is never picked silently.
     """
-    record = _select_definition(req.device_type, req.version)
+    detect_mode = req.version_mode == "detect"
+
+    if detect_mode:
+        records = database.list_definitions(req.device_type, include_inactive=True)
+        if not records:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no definitions found for device type '{req.device_type}'",
+            )
+        records.sort(key=lambda r: database.version_key(r["version"]))
+        selected_version = None
+        definition_active = None
+    else:
+        record = _select_definition(req.device_type, req.version)
+        selected_version = record["version"]
+        definition_active = record["active"]
 
     sync = _decode_hex(req.sync_hex)
 
@@ -369,6 +425,8 @@ def stream_parse(req: StreamParseRequest):
     )
 
     def validate(frame: bytes) -> dict:
+        if detect_mode:
+            return _validate_frame_detect(frame)
         try:
             result = parse_message(record["fields"], record["checksum"], frame)
         except ParseError as exc:
@@ -400,6 +458,64 @@ def stream_parse(req: StreamParseRequest):
             **result,
         }
 
+    def _validate_frame_detect(frame: bytes) -> dict:
+        """Try every registered version (including inactive ones), in version
+        order. Exactly one match accepts the frame; zero matches resyncs with
+        per-version failure reasons; several matches resync with an explicit
+        ``ambiguous_version`` rejection instead of guessing the newest one."""
+        candidates = []
+        failures = []
+        for record in records:
+            result, rejection = _match_definition(record, frame, unit="frame")
+            if rejection is None:
+                candidates.append(
+                    {"version": record["version"], "active": record["active"]}
+                )
+                matched_result = _parse_result_for_record(record, result)
+            else:
+                kind, detail = rejection
+                failures.append(
+                    {
+                        "version": record["version"],
+                        "active": record["active"],
+                        "reason": detail,
+                        "category": kind,
+                    }
+                )
+
+        if len(candidates) == 1:
+            return matched_result
+
+        if not candidates:
+            # Mirror the fixed-mode checksum reason only when every version
+            # failed at checksum verification; a mix of failures (too short,
+            # trailing bits, ...) stays a generic parse rejection.
+            all_checksum = bool(failures) and all(
+                f["category"] == REASON_CHECKSUM for f in failures
+            )
+            umbrella = REASON_CHECKSUM if all_checksum else REASON_PARSE_ERROR
+            public_failures = [
+                {"version": f["version"], "active": f["active"], "reason": f["reason"]}
+                for f in failures
+            ]
+            reasons = "; ".join(
+                f"{f['version']}: {f['reason']}" for f in failures
+            )
+            raise RejectFrame(
+                f"no registered version matches the frame ({len(failures)} "
+                f"version(s) tried): {reasons}",
+                reason=umbrella,
+                failures=public_failures,
+            )
+
+        raise RejectFrame(
+            f"frame matches {len(candidates)} registered versions "
+            f"({', '.join(c['version'] for c in candidates)}); "
+            f"cannot pick a version without an explicit hint",
+            reason=REASON_AMBIGUOUS_VERSION,
+            candidates=candidates,
+        )
+
     framer = StreamFramer(spec, validate)
     try:
         for piece in pieces:
@@ -408,10 +524,13 @@ def stream_parse(req: StreamParseRequest):
         raise HTTPException(status_code=422, detail=str(exc))
 
     incomplete = framer.finish()
-    return {
-        "device_type": record["device_type"],
-        "version": record["version"],
-        "definition_active": record["active"],
+    response = {
+        "device_type": req.device_type,
+        # In detect mode the version is a per-frame attribute; the top-level
+        # fields report null rather than silently naming one version.
+        "version": selected_version,
+        "definition_active": definition_active,
+        "version_mode": req.version_mode,
         "sync_hex": sync.hex(),
         "received_bytes": sum(len(p) for p in pieces),
         "frame_count": len(framer.frames),
@@ -427,17 +546,7 @@ def stream_parse(req: StreamParseRequest):
         ],
         "discarded_count": len(framer.discarded),
         "discarded_bytes": sum(r.end - r.start for r in framer.discarded),
-        "discarded_ranges": [
-            {
-                "start": rng.start,
-                "end": rng.end,
-                "length": rng.end - rng.start,
-                "hex": rng.hex,
-                "reason": rng.reason,
-                "detail": rng.detail,
-            }
-            for rng in framer.discarded
-        ],
+        "discarded_ranges": [],
         "incomplete_bytes": len(incomplete),
         "incomplete_hex": incomplete.hex(),
         "limits": {
@@ -445,6 +554,23 @@ def stream_parse(req: StreamParseRequest):
             "max_frame_bytes": MAX_FRAME_SIZE,
         },
     }
+    for rng in framer.discarded:
+        entry = {
+            "start": rng.start,
+            "end": rng.end,
+            "length": rng.end - rng.start,
+            "hex": rng.hex,
+            "reason": rng.reason,
+            "detail": rng.detail,
+        }
+        # failures/candidates only appear on detect-mode rejections, keeping
+        # the fixed-mode payload key-for-key compatible.
+        if rng.failures is not None:
+            entry["failures"] = rng.failures
+        if rng.candidates is not None:
+            entry["candidates"] = rng.candidates
+        response["discarded_ranges"].append(entry)
+    return response
 
 
 @app.post("/api/v1/encode")
