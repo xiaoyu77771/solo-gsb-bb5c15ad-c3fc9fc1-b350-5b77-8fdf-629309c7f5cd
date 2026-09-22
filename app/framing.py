@@ -25,7 +25,7 @@ kept in a cross-chunk buffer and is never reported as an error.
 """
 
 from dataclasses import dataclass
-from typing import Callable, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 # Hard safety limits shared with the API layer.
 MAX_BUFFER_SIZE = 1024 * 1024  # 1 MiB of retained (unframed) bytes
@@ -36,6 +36,8 @@ REASON_NOISE = "noise"  # bytes outside any frame (before a sync)
 REASON_INVALID_LENGTH = "invalid_length"  # sync found, length value unusable
 REASON_PARSE_ERROR = "parse_error"  # frame rejected by the parse/verify callback
 REASON_CHECKSUM = "checksum"  # kept distinct for callers that want it
+# detect mode: the frame matches several registered versions at once
+REASON_AMBIGUOUS_VERSION = "ambiguous_version"
 
 
 class FramingError(Exception):
@@ -51,13 +53,21 @@ class RejectFrame(Exception):
     """Raised by a frame-validation callback to force one-byte resync.
 
     ``reason`` should be one of the ``REASON_*`` constants (defaults to a
-    generic parse failure); ``detail`` is a human-readable explanation.
+    generic parse failure); ``detail`` is a human-readable explanation;
+    ``extra`` carries structured per-version diagnostics (used by detect
+    mode's failure/candidate listings).
     """
 
-    def __init__(self, detail: str, reason: str = REASON_PARSE_ERROR):
+    def __init__(
+        self,
+        detail: str,
+        reason: str = REASON_PARSE_ERROR,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__(detail)
         self.detail = detail
         self.reason = reason
+        self.extra = extra
 
 
 Endianness = Literal["big", "little"]
@@ -85,6 +95,10 @@ class DiscardedRange:
     reason: str
     detail: Optional[str] = None
     hex: str = ""
+    # Detect-mode diagnostics only: per-version failure reasons (zero
+    # candidates) or the candidate version list (several candidates).
+    failures: Optional[List[Dict[str, Any]]] = None
+    candidates: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -210,7 +224,7 @@ class StreamFramer:
             try:
                 result = self._validate(candidate)
             except RejectFrame as exc:
-                self._reject_one_byte(exc.reason, exc.detail)
+                self._reject_one_byte(exc.reason, exc.detail, exc.extra)
                 continue
 
             start = self._base
@@ -225,11 +239,22 @@ class StreamFramer:
             del self._buffer[:frame_len]
             self._base += frame_len
 
-    def _reject_one_byte(self, reason: str, detail: str) -> None:
+    def _reject_one_byte(
+        self,
+        reason: str,
+        detail: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Discard exactly the candidate sync byte and resync past it."""
-        self._discard(1, reason, detail)
+        self._discard(1, reason, detail, extra)
 
-    def _discard(self, count: int, reason: str, detail: Optional[str] = None) -> None:
+    def _discard(
+        self,
+        count: int,
+        reason: str,
+        detail: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if count <= 0:
             return
         start = self._base
@@ -241,6 +266,8 @@ class StreamFramer:
                 reason=reason,
                 detail=detail,
                 hex=dropped.hex(),
+                failures=extra.get("failures") if extra else None,
+                candidates=extra.get("candidates") if extra else None,
             )
         )
         del self._buffer[:count]

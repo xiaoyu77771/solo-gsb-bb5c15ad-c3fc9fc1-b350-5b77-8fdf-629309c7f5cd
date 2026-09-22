@@ -80,7 +80,7 @@ docker compose up --build
 | POST | `/api/v1/definitions/{device_type}/{version}/deactivate` | 停用定义 |
 | POST | `/api/v1/definitions/{device_type}/compatibility` | 两个已注册版本的报文布局兼容性分析（>256 个等价类组合或任一版本含 `repeat` 定义返回 422） |
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
-| POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析 |
+| POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析；`version_mode="detect"` 时每帧在全部已注册版本（含停用）中自动识别 |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 | POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
@@ -415,7 +415,8 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 | 参数 | 说明 |
 | ---- | ---- |
-| `device_type` / `version` | 版本选择规则与 `/parse` 一致（`version` 缺省取最新启用版本） |
+| `device_type` / `version` | 固定版本模式（`version_mode` 缺省或 `"fixed"`）下，版本选择规则与 `/parse` 一致（`version` 缺省取最新启用版本）；detect 模式下不允许传 `version` |
+| `version_mode` | `"fixed"`（默认，维持原有固定版本行为）或 `"detect"`（每帧自动识别版本，详见下文） |
 | `sync_hex` | 帧头同步字节（一或多字节），如 `"aa55"`；支持跨块匹配（`…aa` 与 `55…` 分两块到达也能识别） |
 | `length_field_offset` | 长度字段相对同步头的字节偏移（≥0） |
 | `length_field_bytes` | 无符号长度字段宽度（1～8 字节） |
@@ -437,6 +438,7 @@ total = length_field_offset + length_field_bytes + length_value + length_adjustm
 - **噪声**：同步头之前的字节作为 `noise` 丢弃（包括尾部恰好无法构成同步头的同步起始字节）。
 - **非法长度**：长度值加修正后短于帧头本身（如为负）时丢弃该候选同步字节并继续寻找下一个同步头。
 - **解析 / 校验失败**：整帧到达后交给现有解析器；报文过短、解析失败、校验字段被分支跳过、校验和不符或定义未完整消费帧（存在尾部位）时，**逐字节重同步**——只丢弃该候选同步字节，从下一个同步头重试，避免一个坏帧导致整流失联。
+- **detect 模式下的识别失败同样逐字节重同步**：零版本命中时该丢弃区间的 `reason` 沿用 `parse_error` / `checksum`，并在 `failures` 中列出**每个版本**的失败原因；多版本同时命中时丢弃候选且 `reason` 为 **`ambiguous_version`**，`candidates` 列出全部候选版本（**绝不静默选择最新版**）。
 - **末尾未完成帧不是错误**：最后一个分块处理完后仍滞留的字节（半帧或半个同步头）通过 `incomplete_hex` 返回，调用方可在后续请求中续传（本接口为无状态单次重组，续传需调用方自行拼接后重发）。
 - **硬性上限**：滞留的未分帧缓冲超过 **1 MiB**，或长度字段声明的单帧超过 **64 KiB**，返回 `422`（这类情况无法安全缓冲，不做静默丢弃）。
 
@@ -444,8 +446,9 @@ total = length_field_offset + length_field_bytes + length_value + length_adjustm
 
 **响应**
 
-- `frames[]`：每帧含相对拼接字节流的原始半开区间偏移 `start` / `end`、`length`、原始 `hex`，以及与 `/parse` 完全一致的 `result`（字段、分支、校验结果等）。
-- `discarded_ranges[]`：每个被丢弃区间含 `start` / `end` / `length` / `hex`、`reason`（`noise` / `invalid_length` / `parse_error` / `checksum`）及 `detail`。
+- 顶层含 `version_mode`（`"fixed"` / `"detect"`）；固定模式下顶层 `version` / `definition_active` 为被选定义，detect 模式下二者为 `null`（版本逐帧不同）。
+- `frames[]`：每帧含相对拼接字节流的原始半开区间偏移 `start` / `end`、`length`、原始 `hex`，以及与 `/parse` 完全一致的 `result`（字段、分支、校验结果等）。`result` 内始终带该帧实际命中的 `version` 与 `definition_active`，detect 模式下据此区分同一批分块中的混合固件版本。
+- `discarded_ranges[]`：每个被丢弃区间含 `start` / `end` / `length` / `hex`、`reason`（`noise` / `invalid_length` / `parse_error` / `checksum` / detect 模式专属的 `ambiguous_version`）及 `detail`；detect 模式的识别失败还会附加 `failures`（各版本失败原因）或 `candidates`（候选版本列表）。
 - `incomplete_hex` / `incomplete_bytes`：末尾滞留的未完成字节（为空串表示流恰好在帧边界结束）。
 - 另有 `received_bytes`、`frame_count`、`discarded_count`、`discarded_bytes` 与 `limits` 汇总。
 
@@ -491,6 +494,84 @@ curl -X POST http://localhost:8000/api/v1/stream/parse \
 ```
 
 > 第二个分块尾部 `aa0402ffff` 是尚未收完（缺 1 字节校验位）的帧，计入 `incomplete_hex` 而**不**返回错误。`chunks` 为空列表是合法的空流（200，无帧无丢弃）；某个分块 hex 非法时返回 `422` 并在 `detail` 中标注下标（如 `chunks[1]: …`），整个请求不会产生部分分帧结果。
+
+#### detect 模式：同一批分块承载混合固件版本
+
+现场设备可能在一次串口 / TCP 抓取里混有不同固件版本的帧，且事先不知道每一帧属于哪一版。请求体加 `"version_mode": "detect"`（**不要**再传 `version`，否则 `422`）即可：每个**完整候选帧**都会用该 `device_type` 下**全部已注册版本（含停用版本）**逐一校验，规则与 `/detect` 相同——完整消费帧、配置了校验和时还须校验通过。**恰好一个版本命中才接收**；零命中按上面的逐字节重同步处理，多版本命中同样丢弃候选但以 `ambiguous_version` 区分。
+
+示例设备 `fw_mix` 注册了两版（同样的分帧：`AA | len | …`，长度值计长度字段之后的字节数）：
+
+- `1.0.0`：`AA | 2 | a | sum8`（长度值 2，总 4 字节）
+- `2.0.0`：`AA | 3 | a | b | xor8`（长度值 3，总 5 字节）
+
+```bash
+# 两帧版本不同、且一帧横跨两个 chunks，前导 99 为噪声
+curl -X POST http://localhost:8000/api/v1/stream/parse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_type": "fw_mix",
+    "version_mode": "detect",
+    "sync_hex": "aa",
+    "length_field_offset": 1,
+    "length_field_bytes": 1,
+    "chunks": ["99aa02", "10bc"]
+  }'
+```
+
+> 上例第一批只到 v1 帧的一半（`aa0210` 还差 1 字节校验位），随后的分块会透明拼接；也可以把 v1、v2 两帧放进同一批或任意切分。
+
+唯一命中时每帧结果自带版本信息，响应（节选）：
+
+```json
+{
+  "device_type": "fw_mix",
+  "version_mode": "detect",
+  "version": null,
+  "definition_active": null,
+  "frame_count": 1,
+  "frames": [
+    {"start": 1, "end": 5, "length": 4, "hex": "aa0210bc",
+     "result": {"device_type": "fw_mix", "version": "1.0.0", "definition_active": true,
+                "fields": [{"name": "a", "value": 16}, {"name": "sum", "value": 188}],
+                "checksum": {"field": "sum", "algorithm": "sum8", "valid": true}}}
+  ],
+  "discarded_ranges": [
+    {"start": 0, "end": 1, "length": 1, "hex": "99", "reason": "noise", "detail": null}
+  ],
+  "incomplete_hex": "",
+  "limits": {"max_buffer_bytes": 1048576, "max_frame_bytes": 65536}
+}
+```
+
+零版本命中时，被丢弃候选区间在普通 `reason`/`detail` 之外附加各版本失败原因（`reason` 只要有任一版本走到校验和失败即为 `checksum`，否则为 `parse_error`）：
+
+```json
+{
+  "start": 0, "end": 1, "hex": "aa",
+  "reason": "checksum",
+  "detail": "no registered version matches the frame",
+  "failures": [
+    {"version": "1.0.0", "active": false, "reason": "definition does not fully consume the message: 8 trailing bit(s)"},
+    {"version": "2.0.0", "active": true,  "reason": "checksum mismatch: expected 0x1234, calculated 0x5678"}
+  ]
+}
+```
+
+多版本同时命中时（如两版线格式完全一致），候选帧同样被逐字节丢弃，但 `reason` 为 `ambiguous_version` 并列出候选，调用方需自行消歧（例如改用固定版本模式）：
+
+```json
+{
+  "start": 0, "end": 1, "hex": "aa",
+  "reason": "ambiguous_version",
+  "detail": "frame matches multiple registered versions; an explicit version is required",
+  "candidates": [
+    {"version": "1.0.0", "active": true},
+    {"version": "2.0.0", "active": false}
+  ]
+}
+```
+
+> detect 模式只改变逐帧校验方式：64 KiB 单帧与 1 MiB 缓冲上限、逐字节重同步、`incomplete_hex` 末尾保留等行为与固定模式完全一致；该设备类型没有任何注册版本（含停用）时返回 `404`。不传 `version_mode`（或显式传 `"fixed"`）时，请求/响应与既有固定版本行为保持兼容（响应中新增的 `version_mode` 字段恒为 `"fixed"`，帧结果仍带 `version` 与 `definition_active`）。
 
 ### 9. 解析回归样例（/fixtures）
 
@@ -635,7 +716,7 @@ app/
   schemas.py    # 请求模型与定义语义校验
   parser.py     # 按位解析器（位读取、条件分支、repeat 数组展开、校验和验证）
   encoder.py    # 按位编码器（位写入、scale/offset 反算、repeat 数组、校验和自动写入）
-  framing.py    # 字节流分帧（同步头 + 长度字段、跨块缓冲、逐字节重同步、1 MiB/64 KiB 上限）
+  framing.py    # 字节流分帧（同步头 + 长度字段、跨块缓冲、逐字节重同步、detect 多版本识别、1 MiB/64 KiB 上限）
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus

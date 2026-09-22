@@ -2390,6 +2390,280 @@ def test_stream_declared_frame_over_64kib_422():
     assert "65536" in resp.json()["detail"]
 
 
+# ----------------------------------------- stream version_mode=detect support --
+
+
+# Two firmware generations sharing the same wire framing (sync AA + 1-byte
+# big-endian length) but with different layouts:
+#   1.0.0: AA | len | a(1B) | sum8(1B)         -> length value 2, total 4
+#   2.0.0: AA | len | a(1B) | b(1B) | xor8(1B) -> length value 3, total 5
+# No frame of one layout can validate under the other version (too short vs
+# trailing bits), so detection is unambiguous for well-formed frames.
+def _register_stream_detect_versions(device="stream_detect"):
+    # idempotent: shared across tests and also registered once at import time
+    for version, fields, algorithm in (
+        ("1.0.0",
+         [
+             {"name": "sync", "type": "uint", "bit_length": 8},
+             {"name": "length", "type": "uint", "bit_length": 8},
+             {"name": "a", "type": "uint", "bit_length": 8},
+             {"name": "sum", "type": "uint", "bit_length": 8},
+         ],
+         "sum8"),
+        ("2.0.0",
+         [
+             {"name": "sync", "type": "uint", "bit_length": 8},
+             {"name": "length", "type": "uint", "bit_length": 8},
+             {"name": "a", "type": "uint", "bit_length": 8},
+             {"name": "b", "type": "uint", "bit_length": 8},
+             {"name": "xor", "type": "uint", "bit_length": 8},
+         ],
+         "xor8"),
+    ):
+        resp = client.post("/api/v1/definitions", json={
+            "device_type": device,
+            "version": version,
+            "fields": fields,
+            "checksum": {"field": fields[-1]["name"], "algorithm": algorithm},
+        })
+        assert resp.status_code in (201, 409), resp.text
+
+
+def _detect_v1_frame(a: int) -> bytes:
+    body = bytes([0xAA, 2, a])
+    return body + bytes([sum(body) & 0xFF])
+
+
+def _detect_v2_frame(a: int, b: int) -> bytes:
+    body = bytes([0xAA, 3, a, b])
+    return body + bytes([xor8(body)])
+
+
+# Shared by several tests below; registered once (the DB outlives a single
+# test, like the stream_dev definition registered by test_stream_register).
+_register_stream_detect_versions()
+
+
+def _stream_detect_request(chunks, device="stream_detect", **overrides):
+    payload = {
+        "device_type": device,
+        "version_mode": "detect",
+        **STREAM_PARAMS,
+        "chunks": list(chunks),
+    }
+    payload.update(overrides)
+    return client.post("/api/v1/stream/parse", json=payload)
+
+
+def test_stream_detect_mixed_firmware_versions_in_one_batch():
+    _register_stream_detect_versions()
+    f1 = _detect_v1_frame(0x7E)
+    f2 = _detect_v2_frame(0x11, 0x22)
+    noise = bytes([0x99])
+    resp = _stream_detect_request([(noise + f1 + f2).hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # detect-mode response has no single selected version, and labels mode
+    assert data["version_mode"] == "detect"
+    assert data["version"] is None
+    assert data["definition_active"] is None
+    assert data["frame_count"] == 2
+    r1, r2 = (fr["result"] for fr in data["frames"])
+    assert r1["version"] == "1.0.0"
+    assert r1["definition_active"] is True
+    assert r1["device_type"] == "stream_detect"
+    assert r1["fields"][-1]["name"] == "sum"
+    assert r1["checksum"]["valid"] is True
+    assert r2["version"] == "2.0.0"
+    assert r2["definition_active"] is True
+    assert {f["name"] for f in r2["fields"]} == {"sync", "length", "a", "b", "xor"}
+    assert r2["checksum"]["valid"] is True
+    # offsets account for the single leading noise byte
+    assert [(fr["start"], fr["end"], fr["length"]) for fr in data["frames"]] == [
+        (1, 5, 4), (5, 10, 5),
+    ]
+    assert data["discarded_ranges"][0]["hex"] == "99"
+
+
+def test_stream_detect_frames_may_span_chunks():
+    _register_stream_detect_versions()
+    f1 = _detect_v1_frame(0x01)
+    f2 = _detect_v2_frame(0x33, 0x44)
+    stream = f1 + f2
+    # split the mixed stream at an arbitrary boundary mid-frame
+    cut = 7
+    resp = _stream_detect_request([stream[:cut].hex(), stream[cut:].hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 2
+    assert [fr["result"]["version"] for fr in data["frames"]] == ["1.0.0", "2.0.0"]
+    assert data["incomplete_hex"] == ""
+
+
+def test_stream_detect_includes_deactivated_versions():
+    # dedicated device: deactivation must not leak into the other tests
+    device = "stream_detect_inactive"
+    _register_stream_detect_versions(device)
+    assert client.post(
+        f"/api/v1/definitions/{device}/1.0.0/deactivate"
+    ).status_code == 200
+    f1 = _detect_v1_frame(0x10)
+    f2 = _detect_v2_frame(0x20, 0x30)
+    resp = _stream_detect_request([(f1 + f2).hex()], device=device)
+    assert resp.status_code == 200, resp.text
+    results = [fr["result"] for fr in resp.json()["frames"]]
+    assert results[0]["version"] == "1.0.0"
+    assert results[0]["definition_active"] is False
+    assert results[1]["version"] == "2.0.0"
+    assert results[1]["definition_active"] is True
+
+
+def test_stream_detect_zero_matches_resyncs_with_per_version_failures():
+    _register_stream_detect_versions()
+    bad = bytearray(_detect_v2_frame(0x01, 0x02))
+    bad[-1] ^= 0xFF  # corrupt checksum of the 5-byte frame
+    good = _detect_v1_frame(0x42)
+    resp = _stream_detect_request([(bytes(bad) + good).hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["frames"][0]["result"]["version"] == "1.0.0"
+    # the bad candidate was resynced one byte at a time; first record carries
+    # the checksum classification plus every version's failure reason
+    first = data["discarded_ranges"][0]
+    assert (first["start"], first["end"]) == (0, 1)
+    assert first["reason"] == REASON_CHECKSUM
+    assert first["detail"] == "no registered version matches the frame"
+    failures = {f["version"]: f for f in first["failures"]}
+    assert set(failures) == {"1.0.0", "2.0.0"}
+    # the 5-byte frame overflows the 4-byte v1 layout and fails v2's checksum
+    assert "trailing" in failures["1.0.0"]["reason"]
+    assert "checksum mismatch" in failures["2.0.0"]["reason"]
+    assert failures["1.0.0"]["active"] is True
+    assert "candidates" not in first
+    # all 5 bad bytes were dropped before the good frame at offset 5
+    assert data["frames"][0]["start"] == 5
+
+
+def test_stream_detect_parse_error_kind_when_no_checksum_was_attempted():
+    # a complete 2-byte candidate is too short for every version: this is a
+    # parse_error resync, not a checksum resync
+    _register_stream_detect_versions()
+    bogus = bytes([0xAA, 0x00])
+    good = _detect_v2_frame(0x55, 0x66)
+    resp = _stream_detect_request([(bogus + good).hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    first = data["discarded_ranges"][0]
+    assert first["reason"] == REASON_PARSE_ERROR
+    assert all("too short" in f["reason"] for f in first["failures"])
+
+
+def test_stream_detect_ambiguous_versions_are_never_silently_picked():
+    device = "stream_detect_dup"
+    # 1.0.0 and 2.0.0 share the exact same 4-byte layout and sum8 checksum
+    for version in ("1.0.0", "2.0.0"):
+        assert client.post("/api/v1/definitions", json={
+            "device_type": device,
+            "version": version,
+            "fields": [
+                {"name": "sync", "type": "uint", "bit_length": 8},
+                {"name": "length", "type": "uint", "bit_length": 8},
+                {"name": "a", "type": "uint", "bit_length": 8},
+                {"name": "sum", "type": "uint", "bit_length": 8},
+            ],
+            "checksum": {"field": "sum", "algorithm": "sum8"},
+        }).status_code in (201, 409)
+    body = bytes([0xAA, 2, 0x3C])
+    dup = body + bytes([sum(body) & 0xFF])
+
+    # the ambiguous candidate alone is fully held then rejected: zero frames
+    resp = _stream_detect_request([dup.hex()], device=device)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 0
+    first = data["discarded_ranges"][0]
+    assert (first["start"], first["end"]) == (0, 1)
+    assert first["reason"] == "ambiguous_version"
+    assert [c["version"] for c in first["candidates"]] == ["1.0.0", "2.0.0"]
+    assert all(c["active"] is True for c in first["candidates"])
+    assert "failures" not in first
+    assert "multiple registered versions" in first["detail"]
+
+    # followed by an unambiguous 3.0.0-style frame (5 bytes, xor8) to show
+    # the stream resyncs to its frame after the ambiguous candidate
+    assert client.post("/api/v1/definitions", json={
+        "device_type": device,
+        "version": "3.0.0",
+        "fields": [
+            {"name": "sync", "type": "uint", "bit_length": 8},
+            {"name": "length", "type": "uint", "bit_length": 8},
+            {"name": "a", "type": "uint", "bit_length": 8},
+            {"name": "b", "type": "uint", "bit_length": 8},
+            {"name": "xor", "type": "uint", "bit_length": 8},
+        ],
+        "checksum": {"field": "xor", "algorithm": "xor8"},
+    }).status_code in (201, 409)
+    v3_body = bytes([0xAA, 3, 0x01, 0x02])
+    v3 = v3_body + bytes([xor8(v3_body)])
+    resp = _stream_detect_request([(dup + v3).hex()], device=device)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 1
+    assert data["frames"][0]["result"]["version"] == "3.0.0"
+    assert data["frames"][0]["start"] == 4  # the 4-byte ambiguous frame was dropped
+    assert data["discarded_ranges"][0]["reason"] == "ambiguous_version"
+    assert [c["version"] for c in data["discarded_ranges"][0]["candidates"]] == [
+        "1.0.0", "2.0.0",
+    ]
+
+
+def test_stream_detect_version_hint_is_rejected():
+    _register_stream_detect_versions()
+    resp = _stream_detect_request(["aa"], version="1.0.0")
+    assert resp.status_code == 422
+    assert "detect" in str(resp.json()["detail"])
+
+
+def test_stream_detect_unknown_device_404():
+    resp = _stream_detect_request(["aa"], device="ghost_detect")
+    assert resp.status_code == 404
+
+
+def test_stream_detect_empty_chunks():
+    _register_stream_detect_versions()
+    resp = _stream_detect_request([])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["frame_count"] == 0
+    assert data["discarded_ranges"] == []
+    assert data["incomplete_hex"] == ""
+    assert data["version"] is None
+
+
+def test_stream_fixed_mode_response_is_backwards_compatible():
+    # omitting version_mode keeps the fixed-version behaviour and response
+    frame = _stream_frame(1, 25)
+    resp = _stream_request([frame.hex()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["version_mode"] == "fixed"
+    assert data["version"] == "1.0.0"
+    assert data["definition_active"] is True
+    # fixed-mode discarded ranges carry no detect-only diagnostics
+    bad = bytes.fromhex("aa00")
+    resp = _stream_request([(bad + frame).hex()])
+    first = resp.json()["discarded_ranges"][0]
+    assert "failures" not in first
+    assert "candidates" not in first
+
+    # explicitly passing version_mode="fixed" behaves the same
+    resp = _stream_request([frame.hex()], version_mode="fixed")
+    assert resp.status_code == 200
+    assert resp.json()["version"] == "1.0.0"
+
+
 # ------------------------------------------------- framer unit-level behavior --
 
 

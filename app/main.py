@@ -15,7 +15,9 @@ from .framing import (
     MAX_FRAME_SIZE,
     FrameSpec,
     FramingError,
+    REASON_AMBIGUOUS_VERSION,
     REASON_CHECKSUM,
+    REASON_PARSE_ERROR,
     RejectFrame,
     StreamFramer,
 )
@@ -200,6 +202,80 @@ def _select_definition(device_type: str, version: Optional[str]) -> dict:
     return record
 
 
+def _check_definition(record: dict, data: bytes) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Validate ``data`` against one definition.
+
+    Returns ``(result, reason, kind)``: on a full match ``result`` is the
+    /parse-shaped response and ``reason``/``kind`` are None; otherwise
+    ``result`` is None and ``reason`` explains the rejection while ``kind``
+    is the framing-level classification (``checksum`` or ``parse_error``).
+    """
+    try:
+        parsed = parse_message(record["fields"], record["checksum"], data)
+    except ParseError as exc:
+        return None, str(exc), REASON_PARSE_ERROR
+    # Both framing modes and /detect are byte-granular: a definition leaving
+    # bits unconsumed cannot be self-delimited by a byte length field.
+    if parsed["trailing_bits"]:
+        return (
+            None,
+            f"definition does not fully consume the message: "
+            f"{parsed['trailing_bits']} trailing bit(s)",
+            REASON_PARSE_ERROR,
+        )
+    if record["checksum"]:
+        checksum = parsed["checksum"]
+        if checksum is None:
+            return (
+                None,
+                f"checksum field '{record['checksum']['field']}' was not parsed "
+                f"(skipped by an earlier branch)",
+                REASON_PARSE_ERROR,
+            )
+        if not checksum["valid"]:
+            return (
+                None,
+                f"checksum mismatch: expected {checksum['expected_hex']}, "
+                f"calculated {checksum['calculated_hex']}",
+                REASON_CHECKSUM,
+            )
+    return (
+        {
+            "device_type": record["device_type"],
+            "version": record["version"],
+            "definition_active": record["active"],
+            **parsed,
+        },
+        None,
+        None,
+    )
+
+
+def _match_versions(records: list[dict], data: bytes):
+    """Try each registered definition (caller sets the order).
+
+    Returns ``(candidates, failures)`` where a candidate is the /parse-shaped
+    result paired with its record metadata, and a failure records the
+    per-version reason plus its framing-level ``kind``.
+    """
+    candidates = []
+    failures = []
+    for record in records:
+        result, reason, kind = _check_definition(record, data)
+        if reason is None:
+            candidates.append({"record": record, "result": result})
+        else:
+            failures.append(
+                {
+                    "version": record["version"],
+                    "active": record["active"],
+                    "reason": reason,
+                    "kind": kind,
+                }
+            )
+    return candidates, failures
+
+
 @app.post("/api/v1/parse")
 def parse(req: ParseRequest):
     """Parse a hex payload against a definition (latest active version unless
@@ -243,54 +319,7 @@ def detect(req: DetectRequest):
 
     data = _decode_hex(req.hex)
 
-    candidates = []
-    failures = []
-    for record in records:
-        try:
-            result = parse_message(record["fields"], record["checksum"], data)
-        except ParseError as exc:
-            reason = str(exc)
-        else:
-            reason = None
-            if result["trailing_bits"]:
-                reason = (
-                    f"definition does not fully consume the message: "
-                    f"{result['trailing_bits']} trailing bit(s)"
-                )
-            elif record["checksum"]:
-                checksum = result["checksum"]
-                if checksum is None:
-                    reason = (
-                        f"checksum field '{record['checksum']['field']}' was not parsed "
-                        f"(skipped by an earlier branch)"
-                    )
-                elif not checksum["valid"]:
-                    reason = (
-                        f"checksum mismatch: expected {checksum['expected_hex']}, "
-                        f"calculated {checksum['calculated_hex']}"
-                    )
-
-        if reason is None:
-            candidates.append(
-                {
-                    "version": record["version"],
-                    "active": record["active"],
-                    "result": {
-                        "device_type": record["device_type"],
-                        "version": record["version"],
-                        "definition_active": record["active"],
-                        **result,
-                    },
-                }
-            )
-        else:
-            failures.append(
-                {
-                    "version": record["version"],
-                    "active": record["active"],
-                    "reason": reason,
-                }
-            )
+    candidates, failures = _match_versions(records, data)
 
     if len(candidates) == 1:
         return candidates[0]["result"]
@@ -301,7 +330,10 @@ def detect(req: DetectRequest):
             detail={
                 "message": "no registered version matches the message",
                 "device_type": req.device_type,
-                "failures": failures,
+                "failures": [
+                    {"version": f["version"], "active": f["active"], "reason": f["reason"]}
+                    for f in failures
+                ],
             },
         )
 
@@ -312,7 +344,8 @@ def detect(req: DetectRequest):
             "an explicit version is required",
             "device_type": req.device_type,
             "candidates": [
-                {"version": c["version"], "active": c["active"]} for c in candidates
+                {"version": c["record"]["version"], "active": c["record"]["active"]}
+                for c in candidates
             ],
         },
     )
@@ -332,8 +365,39 @@ def stream_parse(req: StreamParseRequest):
     chunk -- a partial frame or a partial sync marker -- come back as
     ``incomplete_hex`` and are never an error. A retained buffer above 1 MiB
     or a single declared frame above 64 KiB returns 422.
+
+    By default (``version_mode`` absent or ``"fixed"``) every frame is parsed
+    against one definition: the explicit ``version`` if given, else the
+    latest active version; the response stays backwards compatible.
+
+    With ``version_mode="detect"`` (``version`` must be omitted) every
+    complete candidate frame is validated against *all* registered versions
+    of the device type, including deactivated ones. A frame is accepted only
+    when exactly one version fully consumes it and verifies its checksum;
+    each frame result then carries its own ``version`` and
+    ``definition_active``, so a single batch of chunks may contain frames
+    from mixed firmware versions. Zero matches discard the candidate via the
+    usual one-byte resync and record every version's failure reason; several
+    matches discard it as well but flag the range ``ambiguous_version`` and
+    list the candidate versions -- the newest version is never selected
+    silently.
     """
-    record = _select_definition(req.device_type, req.version)
+    detect_mode = req.version_mode == "detect"
+
+    if detect_mode:
+        records = database.list_definitions(
+            req.device_type, include_inactive=True
+        )
+        if not records:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no definitions found for device type '{req.device_type}'",
+            )
+        records.sort(key=lambda r: database.version_key(r["version"]))
+        selected = None
+    else:
+        selected = _select_definition(req.device_type, req.version)
+        records = None
 
     sync = _decode_hex(req.sync_hex)
 
@@ -368,39 +432,49 @@ def stream_parse(req: StreamParseRequest):
         max_frame_size=MAX_FRAME_SIZE,
     )
 
-    def validate(frame: bytes) -> dict:
-        try:
-            result = parse_message(record["fields"], record["checksum"], frame)
-        except ParseError as exc:
-            raise RejectFrame(str(exc))
-        # Frames are byte-granular: a definition leaving bits unconsumed
-        # cannot be self-delimited by a byte length field, so resync.
-        if result["trailing_bits"]:
-            raise RejectFrame(
-                f"definition does not fully consume the frame: "
-                f"{result['trailing_bits']} trailing bit(s)"
-            )
-        if record["checksum"]:
-            checksum = result["checksum"]
-            if checksum is None:
-                raise RejectFrame(
-                    f"checksum field '{record['checksum']['field']}' was not parsed "
-                    f"(skipped by an earlier branch)"
-                )
-            if not checksum["valid"]:
-                raise RejectFrame(
-                    f"checksum mismatch: expected {checksum['expected_hex']}, "
-                    f"calculated {checksum['calculated_hex']}",
-                    reason=REASON_CHECKSUM,
-                )
-        return {
-            "device_type": record["device_type"],
-            "version": record["version"],
-            "definition_active": record["active"],
-            **result,
-        }
+    def validate_fixed(frame: bytes) -> dict:
+        result, reason, kind = _check_definition(selected, frame)
+        if reason is not None:
+            raise RejectFrame(reason, reason=kind)
+        return result
 
-    framer = StreamFramer(spec, validate)
+    def validate_detect(frame: bytes) -> dict:
+        candidates, failures = _match_versions(records, frame)
+        if len(candidates) == 1:
+            return candidates[0]["result"]
+        if not candidates:
+            # Keep the checksum reason distinct whenever any version got far
+            # enough to fail checksum verification; the full per-version
+            # breakdown rides along on the discarded range.
+            kind = (
+                REASON_CHECKSUM
+                if any(f["kind"] == REASON_CHECKSUM for f in failures)
+                else REASON_PARSE_ERROR
+            )
+            raise RejectFrame(
+                "no registered version matches the frame",
+                reason=kind,
+                extra={
+                    "failures": [
+                        {"version": f["version"], "active": f["active"], "reason": f["reason"]}
+                        for f in failures
+                    ]
+                },
+            )
+        raise RejectFrame(
+            "frame matches multiple registered versions; an explicit version is required",
+            reason=REASON_AMBIGUOUS_VERSION,
+            extra={
+                "candidates": [
+                    {"version": c["record"]["version"], "active": c["record"]["active"]}
+                    for c in candidates
+                ]
+            },
+        )
+
+    framer = StreamFramer(
+        spec, validate_detect if detect_mode else validate_fixed
+    )
     try:
         for piece in pieces:
             framer.feed(piece)
@@ -408,10 +482,20 @@ def stream_parse(req: StreamParseRequest):
         raise HTTPException(status_code=422, detail=str(exc))
 
     incomplete = framer.finish()
+    if detect_mode:
+        selection = {
+            "version": None,
+            "definition_active": None,
+        }
+    else:
+        selection = {
+            "version": selected["version"],
+            "definition_active": selected["active"],
+        }
     return {
-        "device_type": record["device_type"],
-        "version": record["version"],
-        "definition_active": record["active"],
+        "device_type": req.device_type,
+        "version_mode": req.version_mode,
+        **selection,
         "sync_hex": sync.hex(),
         "received_bytes": sum(len(p) for p in pieces),
         "frame_count": len(framer.frames),
@@ -428,15 +512,7 @@ def stream_parse(req: StreamParseRequest):
         "discarded_count": len(framer.discarded),
         "discarded_bytes": sum(r.end - r.start for r in framer.discarded),
         "discarded_ranges": [
-            {
-                "start": rng.start,
-                "end": rng.end,
-                "length": rng.end - rng.start,
-                "hex": rng.hex,
-                "reason": rng.reason,
-                "detail": rng.detail,
-            }
-            for rng in framer.discarded
+            _discarded_range_payload(rng) for rng in framer.discarded
         ],
         "incomplete_bytes": len(incomplete),
         "incomplete_hex": incomplete.hex(),
@@ -445,6 +521,24 @@ def stream_parse(req: StreamParseRequest):
             "max_frame_bytes": MAX_FRAME_SIZE,
         },
     }
+
+
+def _discarded_range_payload(rng) -> dict:
+    """Serialize a discarded range, adding failures/candidates only when the
+    validation callback supplied them (detect mode)."""
+    item = {
+        "start": rng.start,
+        "end": rng.end,
+        "length": rng.end - rng.start,
+        "hex": rng.hex,
+        "reason": rng.reason,
+        "detail": rng.detail,
+    }
+    if rng.failures is not None:
+        item["failures"] = rng.failures
+    if rng.candidates is not None:
+        item["candidates"] = rng.candidates
+    return item
 
 
 @app.post("/api/v1/encode")

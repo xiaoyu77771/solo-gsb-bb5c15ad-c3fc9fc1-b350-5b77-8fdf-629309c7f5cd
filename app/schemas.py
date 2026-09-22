@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .checksum import ALGORITHMS
 
@@ -65,6 +65,12 @@ class StreamParseRequest(BaseModel):
 
     device_type: str = Field(min_length=1, max_length=128)
     version: Optional[str] = None  # omitted -> latest active version
+    # "fixed" (default): parse every frame against one selected definition,
+    # keeping the historical behaviour. "detect": validate each complete
+    # candidate frame against every registered version of the device type
+    # (including inactive ones) and accept it only on a unique match, so one
+    # batch of chunks may carry mixed firmware versions.
+    version_mode: Literal["fixed", "detect"] = "fixed"
     sync_hex: str = Field(min_length=2, description="frame-header sync bytes, e.g. 'AA55'")
     length_field_offset: int = Field(
         ge=0, le=64 * 1024 - 1,
@@ -82,6 +88,16 @@ class StreamParseRequest(BaseModel):
         default_factory=list,
         description="hex payload chunks in stream order; frames may span chunks",
     )
+
+    @model_validator(mode="after")
+    def _reject_version_hint_in_detect_mode(self):
+        # Like /detect, version detection must not be steered by a version hint.
+        if self.version_mode == "detect" and self.version is not None:
+            raise ValueError(
+                "version must be omitted when version_mode='detect': every "
+                "registered version is tried for each frame"
+            )
+        return self
 
 
 class EncodeRequest(BaseModel):
